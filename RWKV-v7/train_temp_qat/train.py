@@ -55,6 +55,12 @@ if __name__ == "__main__":
     parser.add_argument("--my_testing", default='x070', type=str)
     parser.add_argument("--my_exit_tokens", default=0, type=int)
 
+    parser.add_argument("--qat", default=0, type=int)       # 1 = enable QAT
+    parser.add_argument("--qat_bits", default=8, type=int)  # quantization bit-width
+    parser.add_argument("--qat_bits_lmhead", default=8, type=int)  # quantization bit-width for lm_head
+    parser.add_argument("--dim_mv_lora", default=0, type=int)   # override D_MV_LORA (0 = use formula)
+    parser.add_argument("--dim_gate_lora", default=0, type=int) # override D_GATE_LORA (0 = use formula)
+
     parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args()
 
@@ -233,7 +239,25 @@ if __name__ == "__main__":
         for k in model.state_dict():
             if k not in load_keys:
                 load_dict[k] = model.state_dict()[k]
+
+    # When loading a non-QAT checkpoint into a QAT model, q_scale buffers won't be
+    # present in load_dict.  We fill them with the current (default ones) so that
+    # load_state_dict succeeds, then re-initialize from weight min/max afterwards.
+    if args.qat == 1:
+        model_sd = model.state_dict()
+        for k in model_sd:
+            if k.endswith('.q_scale') and k not in load_dict:
+                load_dict[k] = model_sd[k]
+
     model.load_state_dict(load_dict)
+
+    # After weights are loaded, (re-)initialize per-channel scales from weight min/max.
+    # This is always correct: for a fresh QAT run it sets scales from the pretrained
+    # weights; for a resumed QAT run the saved q_scale values are already in load_dict
+    # and will be overwritten here, but that is fine because the scales are derived
+    # deterministically from the weights anyway.
+    if args.qat == 1:
+        model.init_quant_scales()
 
     trainer = Trainer.from_argparse_args(
         args,

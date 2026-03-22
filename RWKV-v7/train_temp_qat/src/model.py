@@ -13,6 +13,8 @@ if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 
+from src.quant import QuantizedLinear
+
 try:
     print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
 except:
@@ -20,6 +22,14 @@ except:
 
 def __nop(ob):
     return ob
+
+def make_linear(in_f, out_f, bias=False, args=None):
+    """Create a Linear layer; uses QuantizedLinear when QAT is enabled."""
+    if args is not None and getattr(args, 'qat', 0) == 1:
+        return QuantizedLinear(in_f, out_f, bias=bias,
+                               n_bits=getattr(args, 'qat_bits', 8),
+                               enable_quant=True)
+    return nn.Linear(in_f, out_f, bias=bias)
 
 
 MyModule = nn.Module
@@ -133,13 +143,15 @@ class RWKV_Tmix_x070(MyModule):
             self.a2 = nn.Parameter(ortho_init(torch.zeros(D_AAA_LORA, C), 0.1))
             self.a0 = nn.Parameter(torch.zeros(1,1,C)-0.19 + zigzag*0.3 + linear*0.4)
 
-            D_MV_LORA = max(32, int(round(  (1.7*(C**0.5))  /32)*32)) # suggestion
+            _mv_lora = getattr(args, 'dim_mv_lora', 0)
+            D_MV_LORA = _mv_lora if _mv_lora > 0 else max(32, int(round(  (1.7*(C**0.5))  /32)*32)) # suggestion
             self.v1 = nn.Parameter(torch.zeros(C, D_MV_LORA))
             self.v2 = nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, C), 0.1))
             self.v0 = nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4)
 
             # Note: for some data, you can reduce D_GATE_LORA or even remove this gate
-            D_GATE_LORA = max(32, int(round(  (5*(C**0.5))  /32)*32)) # suggestion
+            _gate_lora = getattr(args, 'dim_gate_lora', 0)
+            D_GATE_LORA = _gate_lora if _gate_lora > 0 else max(32, int(round(  (5*(C**0.5))  /32)*32)) # suggestion
             self.g1 = nn.Parameter(torch.zeros(C, D_GATE_LORA))
             self.g2 = nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, C), 0.1))
 
@@ -148,10 +160,10 @@ class RWKV_Tmix_x070(MyModule):
             self.r_k = nn.Parameter(torch.zeros(H,N)-0.04)
 
             self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-            self.receptance = nn.Linear(C, C, bias=False)
-            self.key = nn.Linear(C, C, bias=False)
-            self.value = nn.Linear(C, C, bias=False)
-            self.output = nn.Linear(C, C, bias=False)
+            self.receptance = make_linear(C, C, bias=False, args=args)
+            self.key = make_linear(C, C, bias=False, args=args)
+            self.value = make_linear(C, C, bias=False, args=args)
+            self.output = make_linear(C, C, bias=False, args=args)
             self.ln_x = nn.GroupNorm(H, C, eps=64e-5) # !!! notice eps value !!!
 
             self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
@@ -210,8 +222,8 @@ class RWKV_CMix_x070(MyModule):
                 ddd[0, 0, i] = i / args.n_embd
             self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
 
-        self.key = nn.Linear(args.n_embd, args.n_embd * 4, bias=False)
-        self.value = nn.Linear(args.n_embd * 4, args.n_embd, bias=False)
+        self.key = make_linear(args.n_embd, args.n_embd * 4, bias=False, args=args)
+        self.value = make_linear(args.n_embd * 4, args.n_embd, bias=False, args=args)
 
         self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
         self.value.weight.data.zero_()
@@ -290,7 +302,21 @@ class RWKV(pl.LightningModule):
         self.blocks = nn.ModuleList([Block(args, i) for i in range(args.n_layer)])
 
         self.ln_out = nn.LayerNorm(args.n_embd)
-        self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
+        head_args = None
+        if args is not None and getattr(args, 'qat', 0) == 1:
+            import copy
+            head_args = copy.copy(args)
+            head_args.qat_bits = getattr(args, 'qat_bits_lmhead', 8)
+        self.head = make_linear(args.n_embd, args.vocab_size, bias=False, args=head_args)
+
+    def init_quant_scales(self):
+        """Initialize per-channel scales for all QuantizedLinear layers using min/max of weights."""
+        count = 0
+        for m in self.modules():
+            if isinstance(m, QuantizedLinear) and m.enable_quant:
+                m.init_quant_params()
+                count += 1
+        rank_zero_info(f"[QAT] Initialized q_scale for {count} QuantizedLinear layers.")
 
     def configure_optimizers(self):
         args = self.args
