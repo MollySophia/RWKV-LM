@@ -60,6 +60,7 @@ if __name__ == "__main__":
     parser.add_argument("--qat_bits_lmhead", default=8, type=int)  # quantization bit-width for lm_head
     parser.add_argument("--dim_mv_lora", default=0, type=int)   # override D_MV_LORA (0 = use formula)
     parser.add_argument("--dim_gate_lora", default=0, type=int) # override D_GATE_LORA (0 = use formula)
+    parser.add_argument("--freeze_emb", default=0, type=int)    # 1 = freeze emb.weight during training
 
     parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args()

@@ -18,7 +18,7 @@ sys.path.insert(0, '..')
 args = types.SimpleNamespace()
 
 DTYPE = torch.half
-USE_CUDA_KERNEL = True  # Use pure Python implementation for compatibility
+USE_CUDA_KERNEL = False  # Use pure Python implementation for compatibility
 HEAD_SIZE = 64  # updated at runtime by load_model
 
 def infer_args_from_checkpoint(path):
@@ -163,15 +163,30 @@ def quantize_tensor(w, n_bits=8):
     w_dequant = w_quant * scale.view(-1, 1)
     return w_dequant.to(torch.half), scale
 
-def apply_quantization_to_model(model, n_bits=8, lmhead_bits=None):
+def apply_quantization_to_model(model, n_bits=8, lmhead_bits=None, q_scales=None):
     """Apply quantization to all Linear layers in the model"""
     if lmhead_bits is None:
         lmhead_bits = n_bits
+    if q_scales is None:
+        q_scales = {}
+
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and module.weight is not None:
             bits = lmhead_bits if name == 'head' else n_bits
-            w_quant, _ = quantize_tensor(module.weight.data, bits)
-            module.weight.data = w_quant
+            qmax = 2 ** (bits - 1) - 1
+
+            if name in q_scales:
+                # Use saved q_scale from checkpoint
+                scale = q_scales[name].float().cuda()
+                w = module.weight.data.float()
+                w_scaled = w / scale.view(-1, 1)
+                w_quant = torch.round(torch.clamp(w_scaled, -qmax, qmax))
+                w_dequant = w_quant * scale.view(-1, 1)
+                module.weight.data = w_dequant.to(torch.half)
+            else:
+                # Fall back to computing scale from min/max
+                w_quant, _ = quantize_tensor(module.weight.data, bits)
+                module.weight.data = w_quant
     return model
 
 ########################################################################################################
@@ -316,10 +331,17 @@ def load_model(model_path, quant_bits=None, lmhead_bits=None):
 
     model = RWKV(model_args).cuda()
 
-    # Skip QAT-specific params, cast to float for loading
+    # Extract q_scale values before removing them
+    q_scales = {}
     keys = list(w.keys())
     for k in keys:
-        if '.q_scale' in k or 'qmin' in k or 'qmax' in k:
+        if '.q_scale' in k:
+            # Extract module name: e.g., "blocks.0.att.receptance.q_scale" -> "blocks.0.att.receptance"
+            module_name = k.replace('.q_scale', '')
+            q_scales[module_name] = w[k]
+            del w[k]
+            continue
+        if 'qmin' in k or 'qmax' in k:
             del w[k]
             continue
         w[k] = w[k].float()
@@ -331,7 +353,9 @@ def load_model(model_path, quant_bits=None, lmhead_bits=None):
     if quant_bits is not None:
         head_bits = lmhead_bits if lmhead_bits is not None else quant_bits
         print(f"Applying {quant_bits}-bit quantization (lm_head: {head_bits}-bit)...")
-        model = apply_quantization_to_model(model, quant_bits, lmhead_bits)
+        if len(q_scales) > 0:
+            print(f"Using saved q_scale values from checkpoint ({len(q_scales)} scales)")
+        model = apply_quantization_to_model(model, quant_bits, lmhead_bits, q_scales)
 
     model.eval()
     return model

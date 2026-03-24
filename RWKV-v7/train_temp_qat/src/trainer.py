@@ -108,6 +108,10 @@ class train_callback(pl.Callback):
                     lll["kt/s"] = kt_s
                 trainer.my_wandb.log(lll, step=int(real_step))
 
+        # Periodically re-initialize quant scales so they track weight drift
+        if getattr(args, 'qat', 0) == 1 and int(real_step) % 100 == 0:
+            pl_module.init_quant_scales()
+
         if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy): # save pth
             if args.magic_prime > 0:
                 if int(real_step) == int(args.magic_prime // args.real_bsz) - 1:
@@ -127,6 +131,10 @@ class train_callback(pl.Callback):
         dataset.real_epoch = int(args.epoch_begin + trainer.current_epoch)
         dataset.world_size = trainer.world_size
         # print(f'########## world_size {dataset.world_size} global_rank {dataset.global_rank} real_epoch {dataset.real_epoch} ##########')
+
+        # Initialize quant scales at the start of training (first epoch, before first batch)
+        if getattr(args, 'qat', 0) == 1 and trainer.current_epoch == 0 and trainer.global_step == 0:
+            pl_module.init_quant_scales()
 
     def on_train_epoch_end(self, trainer, pl_module):
         args = self.args

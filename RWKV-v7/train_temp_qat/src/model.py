@@ -313,8 +313,18 @@ class RWKV(pl.LightningModule):
         """Initialize per-channel scales for all QuantizedLinear layers using min/max of weights."""
         count = 0
         for m in self.modules():
-            if isinstance(m, QuantizedLinear) and m.enable_quant:
-                m.init_quant_params()
+            # Check for q_scale buffer to identify QuantizedLinear (handles DeepSpeed/JIT wrapper)
+            if hasattr(m, 'q_scale') and hasattr(m, 'enable_quant') and m.enable_quant:
+                # Handle JIT-wrapped modules (RecursiveScriptModule doesn't have custom methods)
+                if hasattr(m, 'init_quant_params') and callable(getattr(m, 'init_quant_params', None)):
+                    m.init_quant_params()
+                else:
+                    # Direct initialization for JIT-wrapped modules
+                    with torch.no_grad():
+                        w = m.weight.float()
+                        abs_max = w.abs().amax(dim=1).clamp(min=1e-8)
+                        qmax = float(2 ** (m.n_bits - 1) - 1)
+                        m.q_scale.copy_((abs_max / qmax).to(m.q_scale.dtype))
                 count += 1
         rank_zero_info(f"[QAT] Initialized q_scale for {count} QuantizedLinear layers.")
 
@@ -324,7 +334,11 @@ class RWKV(pl.LightningModule):
         lr_decay = set()
         lr_1x = set()
         lr_2x = set()
+        freeze_emb = getattr(args, 'freeze_emb', 0) == 1
         for n, p in self.named_parameters():
+            if freeze_emb and n == 'emb.weight':
+                p.requires_grad_(False)
+                continue
             if ("att.w0" in n):
                 lr_2x.add(n)
             elif (len(p.squeeze().shape) >= 2) and (args.weight_decay > 0) and (".weight" in n):
