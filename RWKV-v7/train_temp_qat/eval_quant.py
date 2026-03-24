@@ -18,7 +18,7 @@ sys.path.insert(0, '..')
 args = types.SimpleNamespace()
 
 DTYPE = torch.half
-USE_CUDA_KERNEL = False  # Use pure Python implementation for compatibility
+USE_CUDA_KERNEL = True  # Use CUDA kernel for speed if build succeeds
 HEAD_SIZE = 64  # updated at runtime by load_model
 
 def infer_args_from_checkpoint(path):
@@ -121,7 +121,7 @@ if USE_CUDA_KERNEL:
             assert r.dtype == DTYPE
             assert all(x.is_contiguous() for x in [r,w,k,v,a,b])
             y = torch.empty((B, T, C), device=k.device, dtype=DTYPE, memory_format=torch.contiguous_format)
-            torch.ops.wkv7_eval.forward(B, T, C, H, r, w, k, v, a, b, y)
+            torch.ops.wkv7.forward(B, T, C, H, r, w, k, v, a, b, y)
             return y
     def RWKV7_OP(r, w, k, v, a, b):
         return WKV_7.apply(r, w, k, v, a, b)
